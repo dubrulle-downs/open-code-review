@@ -16,6 +16,7 @@
 // keeps it runnable inside actions/github-script without bundling.
 
 const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 
 const SUMMARY_MARKER = "<!-- ocr-summary -->";
 
@@ -201,8 +202,9 @@ async function runPostReviewComments({
   // One human-visible line naming the range this run actually reviewed, so a
   // reader of the summary is never left thinking the findings cover the whole
   // PR. Only rendered when the range really was narrowed.
-  const rangeNote =
-    checkpointEnabled && rangeMode === "checkpoint" && rangeFrom && rangeTo && rangeFrom !== rangeTo
+  const rangeNote = rangeMode === "push" && rangeFrom && rangeTo
+    ? `\n\n_Reviewed pushed range \`${rangeFrom.slice(0, 7)}..${rangeTo.slice(0, 7)}\` only; this run does not cover earlier PR changes._`
+    : checkpointEnabled && rangeMode === "checkpoint" && rangeFrom && rangeTo && rangeFrom !== rangeTo
       ? `\n\n_Reviewed \`${rangeFrom.slice(0, 7)}..${rangeTo.slice(0, 7)}\` only; earlier commits in this PR were reviewed in a previous run._`
       : "";
 
@@ -2575,6 +2577,98 @@ async function resolveCheckpointRange({
   };
 }
 
+// Resolve the immutable two-snapshot range carried by a same-repository
+// pull_request_target synchronize event. This path intentionally does not
+// consult checkpoint comments. Ancestry is required because the CLI computes
+// merge-base(from, to); non-linear history must not widen the selected range.
+function resolvePushReviewRange({
+  workspace = process.env.GITHUB_WORKSPACE || process.cwd(),
+  eventName = "",
+  eventAction = "",
+  headRepository = "",
+  repository = "",
+  draft = false,
+  fullReview = false,
+  before = "",
+  after = "",
+  headSha = "",
+  resolvedHeadSha = headSha,
+  runGit,
+  log = () => {},
+} = {}) {
+  const fail = (message) => {
+    throw new Error(`push review range: ${message}`);
+  };
+  if (eventName !== "pull_request_target") {
+    fail("review_range=push is valid only for pull_request_target events");
+  }
+  if (eventAction !== "synchronize") {
+    fail("review_range=push is valid only for synchronize events");
+  }
+  if (!headRepository || !repository || headRepository !== repository) {
+    fail("the pull request head must belong to the current repository");
+  }
+  if (String(draft).toLowerCase() !== "false") {
+    fail("the pull request must be ready for review");
+  }
+  if (fullReview === true || String(fullReview).toLowerCase() === "true") {
+    fail("full_review conflicts with review_range=push");
+  }
+
+  const validSha = (value) => typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
+  const zeroSha = (value) => /^0{40}$/i.test(value);
+  for (const [name, value] of [["event.before", before], ["event.after", after], ["pull_request.head.sha", headSha]]) {
+    if (!validSha(value) || zeroSha(value)) fail(`${name} must be a non-zero 40-character SHA`);
+  }
+  if (after.toLowerCase() !== headSha.toLowerCase()) {
+    fail(`event.after (${after}) does not match pull_request.head.sha (${headSha})`);
+  }
+
+  if (resolvedHeadSha.toLowerCase() !== after.toLowerCase()) {
+    fail("resolved head override does not match event.after");
+  }
+
+  const execGit = runGit || ((args) => spawnSync("git", args, {
+    cwd: workspace,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  const command = (args) => {
+    const result = execGit(args);
+    if (!result || typeof result.status !== "number") {
+      fail(`git ${args.join(" ")} returned no exit status`);
+    }
+    return result;
+  };
+  const present = (sha) => command(["cat-file", "-e", `${sha}^{commit}`]).status === 0;
+  const ensureCommit = (sha) => {
+    if (present(sha)) return;
+    log(`[review-range] fetching missing commit object ${sha}`);
+    const fetched = command(["fetch", "--no-tags", "--no-prune", "origin", sha]);
+    if (fetched.status !== 0 || !present(sha)) {
+      const detail = String(fetched.stderr || "").trim();
+      fail(`could not resolve commit ${sha}${detail ? ` (${detail})` : ""}`);
+    }
+  };
+  ensureCommit(before);
+  ensureCommit(after);
+  const ancestry = command(["merge-base", "--is-ancestor", before, after]);
+  if (ancestry.status !== 0) {
+    fail(`event.before ${before} is not an ancestor of event.after ${after}; direct snapshot review is unavailable in this OCR version`);
+  }
+
+  return {
+    mode: "push",
+    reason: "event_before_after",
+    from: before,
+    to: after,
+    checkpointBefore: "",
+    ancestry: "",
+    sourceRun: "",
+    fingerprint: "",
+  };
+}
+
 module.exports = {
   runPostReviewComments,
   postSummary,
@@ -2638,6 +2732,7 @@ module.exports = {
   validateCheckpointPayload,
   readCheckpointComment,
   resolveCheckpointRange,
+  resolvePushReviewRange,
   isCheckpointAuthorOurs,
   preserveCheckpointMarker,
   CHECKPOINT_VERSION,
