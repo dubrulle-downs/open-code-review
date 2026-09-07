@@ -4689,6 +4689,11 @@ async function testSummaryShowsNarrowedRangeLabel() {
   });
   assert.strictEqual(clean.includes(label), true);
 
+  const pushed = await withRange({ checkpointEnabled: false, rangeMode: "push", rangeFrom: CK_OLD, rangeTo: CK_NEW }, findings);
+  assert.strictEqual(pushed.includes("Reviewed pushed range"), true, "push summary identifies its limited coverage");
+  assert.strictEqual(pushed.includes("does not cover earlier PR changes"), true);
+  assert.strictEqual(pushed.includes("reviewed in a previous run"), false);
+  assert.strictEqual(parseCheckpointMarker(pushed), null, "push review never claims a complete checkpoint");
   const full = await withRange({ rangeMode: "full", rangeFrom: "", rangeTo: CK_NEW }, findings);
   assert.strictEqual(full.includes("Reviewed `"), false, "a full run must not claim a narrowed range");
   const empty = await withRange({ rangeMode: "checkpoint", rangeFrom: CK_NEW, rangeTo: CK_NEW }, findings);
@@ -4700,7 +4705,9 @@ async function testSummaryShowsNarrowedRangeLabel() {
 // U2. The resolve step only chooses where the review starts; every failure it
 // can hit has the same safe answer. It must never be the reason a job fails.
 function testActionResolveStepNeverFailsTheJob() {
-  const block = actionStepBlock("Resolve review range");
+  // The legacy checkpoint policy keeps its full-range fallback; push mode must not.
+  const step = actionStepBlock("Resolve review range");
+  const block = step.slice(step.indexOf("          // This step only chooses"));
   const tryAt = block.indexOf("\n          try {\n");
   assert.notStrictEqual(tryAt, -1, "the resolve script body must run inside a try");
   // The outer catch, at the script's own indentation — the rule-file reads have
@@ -4798,7 +4805,7 @@ function testActionRangeFromIsAStepOutput() {
 
   const review = actionStepBlock("Run OpenCodeReview");
   assert.strictEqual(review.includes("RANGE_FROM: ${{ steps.range.outputs.range_from }}"), true);
-  assert.strictEqual(review.includes('--from "${RANGE_FROM:-$MERGE_BASE}"'), true, "empty output still means merge-base");
+  assert.strictEqual(review.includes('REVIEW_FROM="${RANGE_FROM:-$MERGE_BASE}"'), true, "legacy PR mode retains its merge-base fallback");
 
   const post = actionStepBlock("Post review comments");
   for (const name of ["checkpoint_carry", "config_fingerprint", "range_mode", "range_from", "range_to", "range_reason"]) {

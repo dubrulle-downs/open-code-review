@@ -146,6 +146,15 @@ inputs:
       exactly as it is today. Requires sticky_summary; ignored without it.
     required: false
     default: 'false'
+  review_range:
+    description: >-
+      'pull_request' preserves merge-base and optional checkpoint behavior.
+      'push' reviews event.before..event.after on same-repository
+      pull_request_target synchronize events. Missing commits or rewritten
+      history fail before review; push mode never falls back to a full PR or
+      advances a checkpoint. Requires full_review=false.
+    required: false
+    default: 'pull_request'
   full_review:
     description: >-
       Force one full review even when checkpoint_range is enabled (reason
@@ -190,29 +199,30 @@ outputs:
     value: ${{ steps.post.outputs.summary_comment_url }}
   range_mode:
     description: >-
-      'checkpoint' when this run reviewed only the range since the previous
+      'push' for a bounded push review, 'checkpoint' for the range since the previous
       checkpoint, 'full' when it reviewed from the merge-base. Empty when
-      checkpoint_range is not enabled.
+      neither push ranges nor checkpoint_range are enabled.
     value: ${{ steps.range.outputs.range_mode }}
   range_summary:
     description: >-
       The reviewed range plus the reason it was chosen, e.g.
       "full (base_changed)" or "checkpoint (ok): <from>..<to>". Empty when
-      checkpoint_range is not enabled.
+      neither push ranges nor checkpoint_range are enabled.
     value: ${{ steps.range.outputs.range_summary }}
   range_reason:
     description: >-
-      Why that mode was chosen: 'ok', 'same_head_noop', or one of the
+      Why that mode was chosen: 'event_before_after', 'ok', 'same_head_noop', or one of the
       fail-closed reasons ('base_changed', 'config_changed', 'not_ancestor', …).
-      Empty when checkpoint_range is not enabled.
+      Empty when neither push ranges nor checkpoint_range are enabled.
     value: ${{ steps.range.outputs.range_reason }}
   range_from:
     description: >-
       The commit this run reviewed from, or empty when it reviewed from the
-      merge-base (every 'full' run, and every run with checkpoint_range off).
+      merge-base (full PR mode without a selected checkpoint). Push mode always
+      reports event.before.
     value: ${{ steps.range.outputs.range_from }}
   range_to:
-    description: The head this run reviewed up to. Empty when checkpoint_range is not enabled.
+    description: The reviewed head; event.after in push mode, empty when range resolution is disabled.
     value: ${{ steps.range.outputs.range_to }}
   checkpoint_before:
     description: >-
@@ -347,6 +357,19 @@ runs:
         fi
         echo "REVIEW_TASK_TIMEOUT=$REVIEW_TASK_TIMEOUT_NUMBER" >> "$GITHUB_ENV"
 
+    - name: Validate review_range
+      shell: bash
+      env:
+        REVIEW_RANGE: ${{ inputs.review_range }}
+      run: |
+        case "$REVIEW_RANGE" in
+          pull_request|push) ;;
+          *)
+            echo "::error::review_range must be 'pull_request' or 'push'"
+            exit 1
+            ;;
+        esac
+
     - name: Install OpenCodeReview
       shell: bash
       env:
@@ -419,11 +442,19 @@ runs:
         ocr config set language "$OCR_LANGUAGE"
 
     - name: Resolve review range
-      if: inputs.checkpoint_range == 'true'
+      if: inputs.review_range == 'push' || inputs.checkpoint_range == 'true'
       id: range
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         OCR_FULL_REVIEW: ${{ inputs.full_review }}
+        OCR_REVIEW_RANGE: ${{ inputs.review_range }}
+        OCR_EVENT_NAME: ${{ github.event_name }}
+        OCR_EVENT_BEFORE: ${{ github.event.before }}
+        OCR_EVENT_AFTER: ${{ github.event.after }}
+        OCR_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        OCR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        OCR_REPOSITORY: ${{ github.repository }}
+        OCR_EVENT_DRAFT: ${{ github.event.pull_request.draft }}
         OCR_STICKY_SUMMARY: ${{ inputs.sticky_summary }}
         # "reopened" / "ready_for_review" ask for a fresh look at the whole PR.
         OCR_EVENT_ACTION: ${{ github.event.action }}
@@ -496,8 +527,10 @@ runs:
           const emit = (range, fingerprint, carry) => {
             const summary = range.mode === 'checkpoint'
               ? `checkpoint (${range.reason}): ${range.from}..${range.to}`
-              : `full (${range.reason})`;
-            core.setOutput('range_from', range.mode === 'checkpoint' ? range.from : '');
+              : range.mode === 'push'
+                ? `push (${range.reason}): ${range.from}..${range.to}`
+                : `full (${range.reason})`;
+            core.setOutput('range_from', range.mode === 'checkpoint' || range.mode === 'push' ? range.from : '');
             core.setOutput('range_to', range.to || '');
             core.setOutput('range_mode', range.mode);
             core.setOutput('range_reason', range.reason);
@@ -507,8 +540,30 @@ runs:
             core.setOutput('source_run', range.sourceRun || '');
             core.setOutput('config_fingerprint', fingerprint);
             core.setOutput('checkpoint_carry', carry);
-            core.info(`[checkpoint] reviewing ${summary}`);
+            core.info(`[review-range] reviewing ${summary}`);
           };
+
+          // Push failures must escape the legacy checkpoint fallback below.
+          if (process.env.OCR_REVIEW_RANGE === 'push') {
+            const helper = path.resolve(process.env.GITHUB_ACTION_PATH, 'scripts/github-actions/post-review-comments.js');
+            const { resolvePushReviewRange } = require(helper);
+            const range = resolvePushReviewRange({
+              workspace: process.env.GITHUB_WORKSPACE,
+              eventName: process.env.OCR_EVENT_NAME,
+              eventAction: process.env.OCR_EVENT_ACTION,
+              headRepository: process.env.OCR_HEAD_REPOSITORY,
+              repository: process.env.OCR_REPOSITORY,
+              draft: process.env.OCR_EVENT_DRAFT,
+              fullReview: process.env.OCR_FULL_REVIEW,
+              before: process.env.OCR_EVENT_BEFORE,
+              after: process.env.OCR_EVENT_AFTER,
+              headSha: process.env.OCR_EVENT_HEAD_SHA,
+              resolvedHeadSha: process.env.OCR_HEAD_SHA,
+              log: message => core.info(message),
+            });
+            emit(range, '', '');
+            return;
+          }
 
           // This step only chooses where the review starts, and every failure it
           // can hit has the same safe answer: review the whole merge-base range.
@@ -664,12 +719,15 @@ runs:
         OCR_LLM_EXTRA_HEADERS: ${{ inputs.llm_extra_headers }}
         OCR_LLM_TIMEOUT: ${{ inputs.llm_timeout }}
         OCR_REVIEW_CONCURRENCY: ${{ inputs.review_concurrency }}
+        OCR_REVIEW_RANGE: ${{ inputs.review_range }}
         OCR_BACKGROUND: ${{ inputs.background }}
         OCR_RULE: ${{ inputs.rule }}
         # Step output, not job env: empty when the resolve step was skipped or
         # chose the full range, and never inherited from an earlier use of this
         # action in the same job.
         RANGE_FROM: ${{ steps.range.outputs.range_from }}
+        RANGE_TO: ${{ steps.range.outputs.range_to }}
+        RANGE_MODE: ${{ steps.range.outputs.range_mode }}
       shell: bash
       run: |
         export OCR_LLM_TIMEOUT="${OCR_LLM_TIMEOUT:-300}"
@@ -677,7 +735,18 @@ runs:
           echo "::error::Validated review_task_timeout is missing; the timeout validation step must complete first"
           exit 1
         fi
-        ARGS=(--from "${RANGE_FROM:-$MERGE_BASE}" --to "${HEAD_SHA}" --audience agent --format json --timeout "$REVIEW_TASK_TIMEOUT")
+        if [[ "$OCR_REVIEW_RANGE" == "push" ]]; then
+          if [[ "$RANGE_MODE" != "push" || ! "$RANGE_FROM" =~ ^[0-9a-fA-F]{40}$ || ! "$RANGE_TO" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Validated push range is missing; refusing a full-review fallback"
+            exit 1
+          fi
+          REVIEW_FROM="$RANGE_FROM"
+          REVIEW_TO="$RANGE_TO"
+        else
+          REVIEW_FROM="${RANGE_FROM:-$MERGE_BASE}"
+          REVIEW_TO="$HEAD_SHA"
+        fi
+        ARGS=(--from "$REVIEW_FROM" --to "$REVIEW_TO" --audience agent --format json --timeout "$REVIEW_TASK_TIMEOUT")
         [ -n "$OCR_REVIEW_CONCURRENCY" ] && ARGS+=(--concurrency "$OCR_REVIEW_CONCURRENCY")
         [ -n "$OCR_BACKGROUND" ] && ARGS+=(--background "$OCR_BACKGROUND")
         [ -n "$OCR_RULE" ] && ARGS+=(--rule "$OCR_RULE")
@@ -758,7 +827,7 @@ runs:
             reviewCommentBatchSize: parseInt(process.env.OCR_REVIEW_COMMENT_BATCH_SIZE, 10),
             routeSeverityBelow: process.env.OCR_ROUTE_SEVERITY_BELOW,
             routeCategories: process.env.OCR_ROUTE_CATEGORIES,
-            checkpointEnabled: ${{ inputs.checkpoint_range == 'true' }},
+            checkpointEnabled: ${{ inputs.checkpoint_range == 'true' && inputs.review_range != 'push' }},
             checkpointCarry: process.env.OCR_CHECKPOINT_CARRY || '',
             checkpointBaseRef: process.env.OCR_BASE_REF || '',
             checkpointMergeBase: process.env.OCR_MERGE_BASE || '',
