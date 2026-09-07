@@ -204,6 +204,8 @@ async function runPostReviewComments({
   // PR. Only rendered when the range really was narrowed.
   const rangeNote = rangeMode === "push" && rangeFrom && rangeTo
     ? `\n\n_Reviewed pushed range \`${rangeFrom.slice(0, 7)}..${rangeTo.slice(0, 7)}\` only; this run does not cover earlier PR changes._`
+    : rangeMode === "last_commit" && rangeFrom && rangeTo
+      ? `\n\n_Reviewed last commit range \`${rangeFrom.slice(0, 7)}..${rangeTo.slice(0, 7)}\` only._`
     : checkpointEnabled && rangeMode === "checkpoint" && rangeFrom && rangeTo && rangeFrom !== rangeTo
       ? `\n\n_Reviewed \`${rangeFrom.slice(0, 7)}..${rangeTo.slice(0, 7)}\` only; earlier commits in this PR were reviewed in a previous run._`
       : "";
@@ -217,6 +219,29 @@ async function runPostReviewComments({
     log("[checkpoint] same head as the recorded checkpoint; leaving the existing summary in place.");
     setStatsOutputs(out, stats);
     return;
+  }
+
+  // Resolve the commit before reading or publishing anything for last_commit.
+  // Issue comments do not carry a PR head in their event payload, so re-read
+  // the PR and require that its live head is still the immutable head selected
+  // by the range resolver. Otherwise this run could attach old analysis to a
+  // newer force-pushed tip or overwrite the summary after the race.
+  let commitSha;
+  if (rangeMode === "last_commit") {
+    if (context.eventName !== "issue_comment") {
+      throw new Error("last_commit review requires an issue_comment event");
+    }
+    const { data: pullRequest } = await github.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: prNumber,
+    });
+    commitSha = pullRequest && pullRequest.head && pullRequest.head.sha;
+    if (typeof commitSha !== "string" || commitSha.toLowerCase() !== String(rangeTo).toLowerCase()) {
+      throw new Error(
+        `last_commit review head changed before publication (review head=${rangeTo || "unknown"}, current head=${commitSha || "unknown"})`
+      );
+    }
   }
 
   // Read OCR output.
@@ -257,10 +282,9 @@ async function runPostReviewComments({
   }
 
   // Resolve the PR head commit sha to attach the review to.
-  let commitSha;
-  if (context.eventName === "pull_request_target") {
+  if (commitSha == null && context.eventName === "pull_request_target") {
     commitSha = context.payload.pull_request.head.sha;
-  } else {
+  } else if (commitSha == null) {
     const { data: pullRequest } = await github.rest.pulls.get({
       owner,
       repo,
@@ -2669,6 +2693,89 @@ function resolvePushReviewRange({
   };
 }
 
+// Resolve the exact first-parent range for an issue-comment-triggered review.
+// The caller supplies a head SHA resolved from the PR API. This function never
+// follows a mutable PR ref after that resolution: a fetch may make the object
+// available, but the supplied SHA remains the only review target.
+function resolveLastCommitReviewRange({
+  workspace = process.env.GITHUB_WORKSPACE || process.cwd(),
+  eventName = "",
+  fullReview = false,
+  headSha = "",
+  resolvedHeadSha = headSha,
+  runGit,
+  log = () => {},
+} = {}) {
+  const fail = (message) => {
+    throw new Error(`last commit review range: ${message}`);
+  };
+  if (eventName !== "issue_comment") {
+    fail("review_range=last_commit is valid only for issue_comment events");
+  }
+  if (String(fullReview).toLowerCase() !== "false") {
+    fail("full_review must be false with review_range=last_commit");
+  }
+
+  const validSha = (value) => typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
+  const zeroSha = (value) => typeof value === "string" && /^0{40}$/i.test(value);
+  if (!validSha(headSha) || zeroSha(headSha)) {
+    fail("head_sha must be a non-zero 40-character SHA");
+  }
+  if (!validSha(resolvedHeadSha) || zeroSha(resolvedHeadSha)) {
+    fail("resolved head SHA must be a non-zero 40-character SHA");
+  }
+  if (resolvedHeadSha.toLowerCase() !== headSha.toLowerCase()) {
+    fail("resolved head SHA does not match the supplied head_sha");
+  }
+
+  const execGit = runGit || ((args) => spawnSync("git", args, {
+    cwd: workspace,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  const command = (args) => {
+    const result = execGit(args);
+    if (!result || typeof result.status !== "number") {
+      fail(`git ${args.join(" ")} returned no exit status`);
+    }
+    return result;
+  };
+  const present = (sha) => command(["cat-file", "-e", `${sha}^{commit}`]).status === 0;
+  const ensureCommit = (sha) => {
+    if (present(sha)) return;
+    log(`[review-range] fetching missing commit object ${sha}`);
+    const fetched = command(["fetch", "--no-tags", "--no-prune", "origin", sha]);
+    if (fetched.status !== 0 || !present(sha)) {
+      const detail = String(fetched.stderr || "").trim();
+      fail(`could not resolve commit ${sha}${detail ? ` (${detail})` : ""}`);
+    }
+  };
+
+  // Prove the supplied target is an actual commit before asking Git for its
+  // parent. A root commit has no first parent and cannot define this range.
+  ensureCommit(headSha);
+  const parentResult = command(["rev-parse", "--verify", `${headSha}^1`]);
+  if (parentResult.status !== 0) {
+    fail(`head ${headSha} has no first parent; root commits cannot be reviewed as a last-commit range`);
+  }
+  const firstParent = String(parentResult.stdout || "").trim();
+  if (!validSha(firstParent) || zeroSha(firstParent)) {
+    fail(`first parent of ${headSha} is not a valid commit SHA`);
+  }
+  ensureCommit(firstParent);
+
+  return {
+    mode: "last_commit",
+    reason: "first_parent",
+    from: firstParent,
+    to: headSha,
+    checkpointBefore: "",
+    ancestry: "",
+    sourceRun: "",
+    fingerprint: "",
+  };
+}
+
 module.exports = {
   runPostReviewComments,
   postSummary,
@@ -2733,6 +2840,7 @@ module.exports = {
   readCheckpointComment,
   resolveCheckpointRange,
   resolvePushReviewRange,
+  resolveLastCommitReviewRange,
   isCheckpointAuthorOurs,
   preserveCheckpointMarker,
   CHECKPOINT_VERSION,

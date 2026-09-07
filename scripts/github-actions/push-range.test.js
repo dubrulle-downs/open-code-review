@@ -74,7 +74,7 @@ test("rejects an unknown policy instead of defaulting to a full review", async t
   const driver = PushRangeDriver.create(t);
   driver.givenInput("review_range", "typo");
   await driver.whenReviewRuns();
-  driver.thenNoReviewIsInvoked(/must be 'pull_request' or 'push'/);
+  driver.thenNoReviewIsInvoked(/must be 'pull_request', 'push', or 'last_commit'/);
 });
 
 test("refuses a full fallback when push range outputs are missing", async t => {

@@ -150,9 +150,11 @@ inputs:
     description: >-
       'pull_request' preserves merge-base and optional checkpoint behavior.
       'push' reviews event.before..event.after on same-repository
-      pull_request_target synchronize events. Missing commits or rewritten
-      history fail before review; push mode never falls back to a full PR or
-      advances a checkpoint. Requires full_review=false.
+      pull_request_target synchronize events. 'last_commit' reviews the exact
+      first-parent(head)..head range for an issue_comment event using the
+      caller's resolved head_sha. Missing commits, a missing first parent, or
+      rewritten history fail before review; push and last_commit modes never
+      fall back to a full PR or advance a checkpoint. Requires full_review=false.
     required: false
     default: 'pull_request'
   full_review:
@@ -199,30 +201,32 @@ outputs:
     value: ${{ steps.post.outputs.summary_comment_url }}
   range_mode:
     description: >-
-      'push' for a bounded push review, 'checkpoint' for the range since the previous
-      checkpoint, 'full' when it reviewed from the merge-base. Empty when
-      neither push ranges nor checkpoint_range are enabled.
+      'push' for a bounded push review, 'last_commit' for the exact first-parent
+      range, 'checkpoint' for the range since the previous checkpoint, 'full'
+      when it reviewed from the merge-base. Empty when no bounded range is enabled.
     value: ${{ steps.range.outputs.range_mode }}
   range_summary:
     description: >-
       The reviewed range plus the reason it was chosen, e.g.
-      "full (base_changed)" or "checkpoint (ok): <from>..<to>". Empty when
-      neither push ranges nor checkpoint_range are enabled.
+      "full (base_changed)", "checkpoint (ok): <from>..<to>", or
+      "last_commit (first_parent): <from>..<to>". Empty when no bounded range
+      is enabled.
     value: ${{ steps.range.outputs.range_summary }}
   range_reason:
     description: >-
-      Why that mode was chosen: 'event_before_after', 'ok', 'same_head_noop', or one of the
-      fail-closed reasons ('base_changed', 'config_changed', 'not_ancestor', …).
-      Empty when neither push ranges nor checkpoint_range are enabled.
+      Why that mode was chosen: 'event_before_after', 'first_parent', 'ok',
+      'same_head_noop', or one of the fail-closed reasons. Empty when no bounded
+      range is enabled.
     value: ${{ steps.range.outputs.range_reason }}
   range_from:
     description: >-
       The commit this run reviewed from, or empty when it reviewed from the
-      merge-base (full PR mode without a selected checkpoint). Push mode always
-      reports event.before.
+      merge-base (full PR mode without a selected checkpoint). Push mode reports
+      event.before; last_commit reports the head's first parent.
     value: ${{ steps.range.outputs.range_from }}
   range_to:
-    description: The reviewed head; event.after in push mode, empty when range resolution is disabled.
+    description: The reviewed head; event.after in push mode or the supplied head_sha
+      in last_commit mode, empty when range resolution is disabled.
     value: ${{ steps.range.outputs.range_to }}
   checkpoint_before:
     description: >-
@@ -363,9 +367,9 @@ runs:
         REVIEW_RANGE: ${{ inputs.review_range }}
       run: |
         case "$REVIEW_RANGE" in
-          pull_request|push) ;;
+          pull_request|push|last_commit) ;;
           *)
-            echo "::error::review_range must be 'pull_request' or 'push'"
+            echo "::error::review_range must be 'pull_request', 'push', or 'last_commit'"
             exit 1
             ;;
         esac
@@ -442,7 +446,7 @@ runs:
         ocr config set language "$OCR_LANGUAGE"
 
     - name: Resolve review range
-      if: inputs.review_range == 'push' || inputs.checkpoint_range == 'true'
+      if: inputs.review_range == 'push' || inputs.review_range == 'last_commit' || inputs.checkpoint_range == 'true'
       id: range
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
@@ -529,8 +533,10 @@ runs:
               ? `checkpoint (${range.reason}): ${range.from}..${range.to}`
               : range.mode === 'push'
                 ? `push (${range.reason}): ${range.from}..${range.to}`
-                : `full (${range.reason})`;
-            core.setOutput('range_from', range.mode === 'checkpoint' || range.mode === 'push' ? range.from : '');
+                : range.mode === 'last_commit'
+                  ? `last_commit (${range.reason}): ${range.from}..${range.to}`
+                  : `full (${range.reason})`;
+            core.setOutput('range_from', range.mode === 'checkpoint' || range.mode === 'push' || range.mode === 'last_commit' ? range.from : '');
             core.setOutput('range_to', range.to || '');
             core.setOutput('range_mode', range.mode);
             core.setOutput('range_reason', range.reason);
@@ -558,6 +564,24 @@ runs:
               before: process.env.OCR_EVENT_BEFORE,
               after: process.env.OCR_EVENT_AFTER,
               headSha: process.env.OCR_EVENT_HEAD_SHA,
+              resolvedHeadSha: process.env.OCR_HEAD_SHA,
+              log: message => core.info(message),
+            });
+            emit(range, '', '');
+            return;
+          }
+
+          // Last-commit failures must escape the legacy checkpoint fallback.
+          // The head was resolved by the caller and is passed through exactly;
+          // this action never substitutes the current PR ref after a fetch.
+          if (process.env.OCR_REVIEW_RANGE === 'last_commit') {
+            const helper = path.resolve(process.env.GITHUB_ACTION_PATH, 'scripts/github-actions/post-review-comments.js');
+            const { resolveLastCommitReviewRange } = require(helper);
+            const range = resolveLastCommitReviewRange({
+              workspace: process.env.GITHUB_WORKSPACE,
+              eventName: process.env.OCR_EVENT_NAME,
+              fullReview: process.env.OCR_FULL_REVIEW,
+              headSha: process.env.OCR_HEAD_SHA,
               resolvedHeadSha: process.env.OCR_HEAD_SHA,
               log: message => core.info(message),
             });
@@ -735,9 +759,9 @@ runs:
           echo "::error::Validated review_task_timeout is missing; the timeout validation step must complete first"
           exit 1
         fi
-        if [[ "$OCR_REVIEW_RANGE" == "push" ]]; then
-          if [[ "$RANGE_MODE" != "push" || ! "$RANGE_FROM" =~ ^[0-9a-fA-F]{40}$ || ! "$RANGE_TO" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::Validated push range is missing; refusing a full-review fallback"
+        if [[ "$OCR_REVIEW_RANGE" == "push" || "$OCR_REVIEW_RANGE" == "last_commit" ]]; then
+          if [[ "$RANGE_MODE" != "$OCR_REVIEW_RANGE" || ! "$RANGE_FROM" =~ ^[0-9a-fA-F]{40}$ || ! "$RANGE_TO" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Validated ${OCR_REVIEW_RANGE} range is missing; refusing a full-review fallback"
             exit 1
           fi
           REVIEW_FROM="$RANGE_FROM"
@@ -827,7 +851,7 @@ runs:
             reviewCommentBatchSize: parseInt(process.env.OCR_REVIEW_COMMENT_BATCH_SIZE, 10),
             routeSeverityBelow: process.env.OCR_ROUTE_SEVERITY_BELOW,
             routeCategories: process.env.OCR_ROUTE_CATEGORIES,
-            checkpointEnabled: ${{ inputs.checkpoint_range == 'true' && inputs.review_range != 'push' }},
+            checkpointEnabled: ${{ inputs.checkpoint_range == 'true' && inputs.review_range != 'push' && inputs.review_range != 'last_commit' }},
             checkpointCarry: process.env.OCR_CHECKPOINT_CARRY || '',
             checkpointBaseRef: process.env.OCR_BASE_REF || '',
             checkpointMergeBase: process.env.OCR_MERGE_BASE || '',
