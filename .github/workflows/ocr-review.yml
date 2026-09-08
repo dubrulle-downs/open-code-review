@@ -1,64 +1,134 @@
-# OpenCodeReview - GitHub Actions PR Auto-Review Pipeline
+# OpenCodeReview PR review.
 #
-# Reviews pull requests using the reusable composite action defined in
-# action.yml at the repo root. See that file for the full list of inputs,
-# outputs, and implementation details (retry, idempotency, artifact upload, etc.).
+# Required repository configuration:
+#   Secret: LITELLM_OCR_API_KEY (dedicated LiteLLM virtual key)
+#   LiteLLM endpoint: http://192.168.1.72:4000/v1/responses (runner LAN access required)
+#   OpenCodeReview protocol: openai-responses
+#   Model alias: ocr-review; reasoning effort is managed by LiteLLM
+#   The action is based on v1.11.3 with the matching CLI version, plus the
+#   openai-responses fix from upstream PR #1135 and strict push ranges.
+#   Keep the action pinned to a commit containing both fixes.
+#   Automatic reviews skip draft PRs. A collaborator can request one with
+#   /open-code-review or @open-code-review in a PR comment.
+#   Add last-commit to review only the current PR head against its first parent.
 #
-# Triggers:
-#   - PR opened (uses pull_request_target for fork secret access)
-#
-# Required secrets (mapped to action inputs):
-#   OCR_LLM_URL           - LLM API endpoint (e.g., https://api.openai.com/v1/chat/completions)
-#   OCR_LLM_AUTH_TOKEN    - Authentication token for the LLM API
-#   OCR_LLM_MODEL         - Model name
-#   OCR_LLM_USE_ANTHROPIC - 'true' for Anthropic Claude, 'false' for OpenAI-compatible
-#
-# Note: GITHUB_TOKEN is automatically provided by GitHub Actions.
+# This trusted workflow is evaluated from the base branch. The action reviews
+# the PR head as git objects; it does not materialize or execute files from the
+# PR branch. The same-repository guard keeps the secret away from fork PRs.
 
 name: OpenCodeReview PR Review
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 on:
-  # Use pull_request_target instead of pull_request so that secrets are
-  # available even for PRs from forks. This is safe because OCR only reads
-  # the diff and does not execute any code from the PR.
   pull_request_target:
-    types: [opened]
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
 
-permissions:
-  contents: read
-  pull-requests: write
+permissions: {}
 
 jobs:
   code-review:
-    runs-on: self-hosted
-    timeout-minutes: 30
-    container:
-      image: node:24
-    if: github.event_name == 'pull_request_target'
-    steps:
-      # Materialize action.yml + scripts/ into the workspace so the local
-      # `uses: ./` action below can be resolved and loaded. For
-      # pull_request_target this checks out the trusted base branch; the
-      # composite action performs its own full checkout (fetch-depth: 0) later.
-      - name: Checkout
-        uses: actions/checkout@v7
+    name: OpenCodeReview
+    permissions:
+      contents: read
+      pull-requests: write
+    if: |
+      (
+        github.event_name == 'pull_request_target'
+        && !github.event.pull_request.draft
+        && github.event.pull_request.head.repo.full_name == github.repository
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.type != 'Bot'
+        && (
+          github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'COLLABORATOR'
+        )
+        && (
+          startsWith(github.event.comment.body, '/open-code-review')
+          || startsWith(github.event.comment.body, '@open-code-review')
+        )
+      )
+    runs-on: [self-hosted, linux, ci]
+    timeout-minutes: 120
 
-      - name: Trust workspace
-        run: git config --global --replace-all safe.directory '*'
+    steps:
+      - name: Resolve review request
+        id: pr-context
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const isComment = context.eventName === 'issue_comment';
+            let reviewRange = context.payload.action === 'synchronize' ? 'push' : 'pull_request';
+            let pullRequest = context.payload.pull_request;
+            if (isComment) {
+              const command = context.payload.comment.body.trim().match(
+                /^[@/]open-code-review(?:\s+(last-commit))?$/,
+              );
+              if (!command) {
+                throw new Error('Unknown review command. Use @open-code-review or @open-code-review last-commit.');
+              }
+              reviewRange = command[1] ? 'last_commit' : 'pull_request';
+              ({ data: pullRequest } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: context.issue.number,
+              }));
+            }
+            core.setOutput('review_range', reviewRange);
+            core.setOutput('full_review', String(reviewRange === 'pull_request'));
+            core.setOutput('incremental', String(reviewRange !== 'pull_request'));
+            core.setOutput('base_ref', pullRequest.base.ref);
+            core.setOutput('head_sha', pullRequest.head.sha);
+            core.setOutput(
+              'same_repository',
+              String(pullRequest.head.repo?.full_name === `${owner}/${repo}`),
+            );
+
+      - name: Validate OpenCodeReview configuration
+        if: github.event_name == 'pull_request_target' || steps.pr-context.outputs.same_repository == 'true'
+        env:
+          LITELLM_OCR_API_KEY: ${{ secrets.LITELLM_OCR_API_KEY }}
+        shell: bash
+        run: |
+          missing=()
+          for name in LITELLM_OCR_API_KEY; do
+            if [[ -z "${!name}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::Missing OpenCodeReview configuration: ${missing[*]}"
+            exit 1
+          fi
 
       - name: Run OpenCodeReview
-        uses: ./
+        if: github.event_name == 'pull_request_target' || steps.pr-context.outputs.same_repository == 'true'
+        uses: dubrulle-downs/open-code-review@1ad8fe7c68856aa081ab955889eeb5df5f8e80a6 # v1.11.3 + PR #1135 + bounded push/last-commit ranges
+        env:
+          # Keep the pinned CLI stable, including during the first version check.
+          OCR_NO_UPDATE: '1'
         with:
-          llm_url: ${{ secrets.OCR_LLM_URL }}
-          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
-          llm_model: ${{ secrets.OCR_LLM_MODEL }}
-          llm_use_anthropic: ${{ secrets.OCR_LLM_USE_ANTHROPIC }}
-          llm_extra_body: '{"enable_thinking": false}'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ocr_version: '1.11.3'
+          review_concurrency: '2'
+          review_range: ${{ steps.pr-context.outputs.review_range }}
+          llm_url: 'http://192.168.1.72:4000/v1/responses'
+          llm_auth_token: ${{ secrets.LITELLM_OCR_API_KEY }}
+          llm_model: 'ocr-review'
+          llm_protocol: 'openai-responses'
+          llm_use_anthropic: 'false'
+          llm_extra_body: '{}'
+          language: 'French'
+          rule: '.opencodereview/rule.json'
+          base_ref: ${{ steps.pr-context.outputs.base_ref }}
+          head_sha: ${{ steps.pr-context.outputs.head_sha }}
           sticky_summary: 'true'
-          incremental: 'false'
-          upload_artifacts: 'true'
+          checkpoint_range: 'false'
+          full_review: ${{ steps.pr-context.outputs.full_review }}
+          incremental: ${{ steps.pr-context.outputs.incremental }}
+          upload_artifacts: 'false'
