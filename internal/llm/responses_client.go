@@ -5,6 +5,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -281,7 +282,7 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 					Arguments: fc.Arguments,
 				},
 			})
-			p := fc.ToParam()
+			p := param.Override[responses.ResponseFunctionToolCallParam](sanitizeResponsesReplayJSON(fc.RawJSON()))
 			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfFunctionCall: &p})
 			hasActionableItem = true
 		case "reasoning":
@@ -293,11 +294,11 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 					reasoningParts = append(reasoningParts, s.Text)
 				}
 			}
-			p := r.ToParam()
+			p := param.Override[responses.ResponseReasoningItemParam](sanitizeResponsesReplayJSON(r.RawJSON()))
 			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfReasoning: &p})
 		case "message":
 			m := item.AsMessage()
-			p := m.ToParam()
+			p := param.Override[responses.ResponseOutputMessageParam](sanitizeResponsesReplayJSON(m.RawJSON()))
 			nativeItems = append(nativeItems, responses.ResponseInputItemUnionParam{OfOutputMessage: &p})
 			hasActionableItem = true
 		}
@@ -345,6 +346,42 @@ func (c *OpenAIResponsesClient) mapResponsesResponse(sdkResp *responses.Response
 			FinishReason: finishReason,
 		}},
 		Usage: usage,
+	}
+}
+
+// sanitizeResponsesReplayJSON removes explicit JSON null fields from native
+// output items before stateless replay. The SDK's ToParam preserves the
+// provider's raw JSON verbatim, but strict OpenAI-compatible endpoints can
+// reject optional fields encoded as null (for example function_call.namespace).
+// Non-null fields, including reasoning encrypted_content, are preserved.
+func sanitizeResponsesReplayJSON(raw string) json.RawMessage {
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return json.RawMessage(raw)
+	}
+	removeNullJSONFields(value)
+
+	sanitized, err := json.Marshal(value)
+	if err != nil {
+		return json.RawMessage(raw)
+	}
+	return sanitized
+}
+
+func removeNullJSONFields(value any) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, nested := range value {
+			if nested == nil {
+				delete(value, key)
+				continue
+			}
+			removeNullJSONFields(nested)
+		}
+	case []any:
+		for _, nested := range value {
+			removeNullJSONFields(nested)
+		}
 	}
 }
 
