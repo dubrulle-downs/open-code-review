@@ -164,7 +164,7 @@ func TestOpenAIResponsesClient_ReplaysReasoningItemBeforeFunctionCall(t *testing
 		"status":"completed",
 		"output":[
 			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"step one"}],"encrypted_content":"enc_abc123"},
-			{"type":"function_call","call_id":"call_xyz","name":"do_thing","arguments":"{\"x\":1}"}
+			{"type":"function_call","id":"fc_xyz","call_id":"call_xyz","name":"do_thing","arguments":"{\"x\":1}","namespace":null,"status":"completed"}
 		],
 		"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7}
 	}`
@@ -181,10 +181,10 @@ func TestOpenAIResponsesClient_ReplaysReasoningItemBeforeFunctionCall(t *testing
 	if items[0].OfReasoning == nil {
 		t.Fatalf("items[0] is not a reasoning item: %+v", items[0])
 	}
-	// ResponseReasoningItem.ToParam() overrides with the item's own RawJSON
-	// (see the SDK's implementation) rather than populating typed fields, so
-	// the payload only surfaces on marshal — reading OfReasoning.EncryptedContent
-	// directly would see the zero value even though replay is intact.
+	// The SDK's response-to-param conversion overrides with the item's own
+	// RawJSON rather than populating typed fields, so the payload only surfaces
+	// on marshal — reading OfReasoning.EncryptedContent directly would see the
+	// zero value even though replay is intact.
 	reasoningJSON, err := json.Marshal(items[0])
 	if err != nil {
 		t.Fatalf("marshal reasoning item: %v", err)
@@ -201,6 +201,13 @@ func TestOpenAIResponsesClient_ReplaysReasoningItemBeforeFunctionCall(t *testing
 	}
 	if !bytes.Contains(functionCallJSON, []byte(`"call_id":"call_xyz"`)) {
 		t.Errorf("function_call item = %s, want call_id %q preserved", functionCallJSON, "call_xyz")
+	}
+	if bytes.Contains(functionCallJSON, []byte(`"namespace":null`)) {
+		t.Errorf("function_call item = %s, want null namespace omitted for replay", functionCallJSON)
+	}
+	if !bytes.Contains(functionCallJSON, []byte(`"id":"fc_xyz"`)) ||
+		!bytes.Contains(functionCallJSON, []byte(`"status":"completed"`)) {
+		t.Errorf("function_call item = %s, want non-null provider metadata preserved", functionCallJSON)
 	}
 
 	// Include must ask the API for encrypted_content, or there would be
