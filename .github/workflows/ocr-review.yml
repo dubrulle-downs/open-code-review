@@ -109,7 +109,7 @@ jobs:
 
       - name: Run OpenCodeReview
         if: github.event_name == 'pull_request_target' || steps.pr-context.outputs.same_repository == 'true'
-        uses: dubrulle-downs/open-code-review@1ad8fe7c68856aa081ab955889eeb5df5f8e80a6 # v1.11.3 + PR #1135 + bounded push/last-commit ranges
+        uses: dubrulle-downs/open-code-review@b01be363588e3c37ead779eb9866fad740169b36 # v1.11.3 + PR #1135 + bounded push/last-commit ranges + Responses replay null-field fix
         env:
           # Keep the pinned CLI stable, including during the first version check.
           OCR_NO_UPDATE: '1'
